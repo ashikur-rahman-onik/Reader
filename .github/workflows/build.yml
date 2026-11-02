@@ -1,5 +1,7 @@
-name: Build Reader APK
+name: Build My Reader APK
 
+# Repo-র root-এ শুধু zip ফাইলটা আপলোড/commit করলেই APK বানানো শুরু হবে।
+# Zip খোলা, build, sign এবং Release তৈরি — সব এই workflow-ই করে।
 on:
   push:
     branches: [main, master]
@@ -11,21 +13,36 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-my-reader
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Extract project zip
+      - name: Find and extract project zip
         run: |
-          ZIP=$(ls -1t *.zip 2>/dev/null | head -n 1)
-          if [ -z "$ZIP" ]; then echo "No .zip found in repo root"; exit 1; fi
-          echo "Using $ZIP"
-          mkdir -p _src
-          unzip -q -o "$ZIP" -d _src
-          PKG=$(find _src -name package.json -not -path "*/node_modules/*" | head -n 1)
-          if [ -z "$PKG" ]; then echo "package.json not found inside zip"; exit 1; fi
+          set -e
+          BEST=""; BEST_T=0
+          for f in *.zip; do
+            [ -f "$f" ] || continue
+            T=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            [ -z "$T" ] && T=0
+            if [ -z "$BEST" ] || [ "$T" -ge "$BEST_T" ]; then BEST="$f"; BEST_T="$T"; fi
+          done
+          if [ -z "$BEST" ]; then echo "::error::Repo root-e kono .zip file nai"; exit 1; fi
+          echo "Using zip: $BEST"
+          rm -rf _src app_build && mkdir -p _src
+          unzip -q -o "$BEST" -d _src
+          rm -rf _src/__MACOSX
+          PKG=$(find _src -maxdepth 3 -name package.json -not -path "*/node_modules/*" | awk '{print length, $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$PKG" ]; then echo "::error::Zip-er bhitore package.json pawa jai ni"; exit 1; fi
           mv "$(dirname "$PKG")" app_build
           ls -la app_build
 
@@ -38,26 +55,31 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
       - name: Install dependencies
         working-directory: app_build
-        run: npm install --no-audit --no-fund
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund || npm install --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 
-      - name: Build web app
+      - name: Set update source and build web app
         working-directory: app_build
-        env:
-          VITE_BUILD: ${{ github.run_number }}
-          VITE_REPO: ${{ github.repository }}
-        run: npm run build
+        run: |
+          echo "{ \"repo\": \"${GITHUB_REPOSITORY}\" }" > src/app-config.json
+          npm run build
 
       - name: Add Android platform
         working-directory: app_build
         run: npx cap add android
 
-      - name: Prepare Android project
+      - name: Prepare Android project (plugin, icons, manifest, version)
         working-directory: app_build
-        env:
-          BUILD_NUMBER: ${{ github.run_number }}
-        run: python3 scripts/prepare-android.py
+        run: |
+          VERSION_CODE=$(( $(date +%s) / 60 ))
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=1.0.${{ github.run_number }}" >> "$GITHUB_ENV"
+          BUILD_NUMBER=${{ github.run_number }} VERSION_CODE=$VERSION_CODE VERSION_NAME=1.0.${{ github.run_number }} python3 scripts/prepare-android.py
 
       - name: Sync Capacitor
         working-directory: app_build
@@ -67,30 +89,36 @@ jobs:
         working-directory: app_build/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Align and sign APK
         working-directory: app_build
         run: |
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
-          IN=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          echo "build-tools: $BT"
+          IN=$(ls android/app/build/outputs/apk/release/*.apk | head -n 1)
+          echo "input apk: $IN"
           "$BT/zipalign" -p -f 4 "$IN" aligned.apk
           "$BT/apksigner" sign --ks native/keystore/reader.p12 --ks-key-alias reader \
             --ks-pass pass:readerapp123 --key-pass pass:readerapp123 \
-            --out "$GITHUB_WORKSPACE/Reader.apk" aligned.apk
-          "$BT/apksigner" verify "$GITHUB_WORKSPACE/Reader.apk"
+            --out "$GITHUB_WORKSPACE/MyReader.apk" aligned.apk
+          "$BT/apksigner" verify --print-certs "$GITHUB_WORKSPACE/MyReader.apk"
+          ls -la "$GITHUB_WORKSPACE/MyReader.apk"
 
-      - name: Upload artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Reader-APK
-          path: Reader.apk
+          name: MyReader-APK
+          path: MyReader.apk
 
-      - name: Publish release (used by in-app updater)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: Reader v1.0.${{ github.run_number }}
-          body: ${{ github.event.head_commit.message }}
-          files: Reader.apk
-          make_latest: true
+      - name: Publish release (used by the in-app updater)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES=$(git log -1 --format=%B | head -c 600)
+          gh release create "build-${VERSION_CODE}" MyReader.apk \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "My Reader ${VERSION_NAME}" \
+            --notes "${NOTES:-My Reader ${VERSION_NAME}}" \
+            --latest
